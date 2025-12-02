@@ -3,7 +3,8 @@ import { Worker, WorkerStatus, SpawnParams } from './types.js';
 
 interface WorkerProcess {
   worker: Worker;
-  process: ChildProcess;
+  workingDir: string;
+  proc: ChildProcess;
 }
 
 export class WorkerManager {
@@ -21,17 +22,6 @@ export class WorkerManager {
       throw new Error(`Worker ${id} already exists`);
     }
 
-    const args = [
-      '--print', params.systemPrompt,
-      '--dangerously-skip-permissions'
-    ];
-
-    const proc = spawn('claude', args, {
-      cwd: params.workingDir || process.cwd(),
-      shell: true,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
     const worker: Worker = {
       id,
       status: 'idle',
@@ -41,19 +31,65 @@ export class WorkerManager {
       createdAt: new Date()
     };
 
-    const workerProcess: WorkerProcess = { worker, process: proc };
+    const args = [
+      '-p', '',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--system-prompt', params.systemPrompt,
+      '--dangerously-skip-permissions'
+    ];
+
+    const proc = spawn('claude', args, {
+      cwd: params.workingDir || process.cwd(),
+      shell: true,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    const workerProcess: WorkerProcess = {
+      worker,
+      workingDir: params.workingDir || process.cwd(),
+      proc
+    };
+
     this.workers.set(id, workerProcess);
 
+    // stdout 파싱
     proc.stdout?.on('data', (data: Buffer) => {
       const text = data.toString();
-      worker.outputBuffer.push(text);
-      if (text.includes('claude>') || text.includes('$')) {
-        worker.status = 'idle';
+      const lines = text.split('\n').filter(l => l.trim());
+
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+
+          // assistant 메시지에서 텍스트 추출
+          if (json.type === 'assistant' && json.message?.content) {
+            const content = json.message.content;
+            if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block.type === 'text') {
+                  worker.outputBuffer.push(block.text);
+                }
+              }
+            }
+          }
+
+          // result면 완료
+          if (json.type === 'result') {
+            worker.status = 'idle';
+          }
+        } catch {
+          // 파싱 실패 무시
+        }
       }
     });
 
     proc.stderr?.on('data', (data: Buffer) => {
-      worker.outputBuffer.push(`[ERROR] ${data.toString()}`);
+      const text = data.toString();
+      if (text.trim()) {
+        worker.outputBuffer.push(`[STDERR] ${text}`);
+      }
     });
 
     proc.on('close', (code) => {
@@ -74,7 +110,16 @@ export class WorkerManager {
     if (!wp) throw new Error(`Worker ${workerId} not found`);
 
     wp.worker.status = 'working';
-    wp.process.stdin?.write(message + '\n');
+
+    const jsonMsg = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: message
+      }
+    });
+
+    wp.proc.stdin?.write(jsonMsg + '\n');
   }
 
   read(workerId: string): string[] {
@@ -96,9 +141,12 @@ export class WorkerManager {
     const wp = this.workers.get(workerId);
     if (!wp) throw new Error(`Worker ${workerId} not found`);
 
-    // Ctrl+C 시뮬레이션
-    wp.process.stdin?.write('\x03');
+    // Escape 보내서 중단
+    wp.proc.stdin?.write('\x1b');
+    wp.worker.outputBuffer.push('[INTERRUPTED]');
+    wp.worker.status = 'idle';
 
+    // 새 메시지 전송
     setTimeout(() => {
       this.send(workerId, message);
     }, 100);
@@ -108,7 +156,7 @@ export class WorkerManager {
     const wp = this.workers.get(workerId);
     if (!wp) return false;
 
-    wp.process.kill('SIGTERM');
+    wp.proc.kill('SIGTERM');
     this.workers.delete(workerId);
     return true;
   }
